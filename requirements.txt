@@ -1,0 +1,10 @@
+langchain
+langchain-groq
+langgraph
+pandas
+openpyxl
+typing_extensions
+langchain-huggingface
+faiss-cpu
+sentence-transformers
+langchain-community
