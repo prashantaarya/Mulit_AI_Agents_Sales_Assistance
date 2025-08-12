@@ -1,337 +1,538 @@
 # tools/hybrid_search.py
 import pandas as pd
-import ast
-from typing import Dict, List, Optional
-from langchain_core.pydantic_v1 import BaseModel, Field
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.docstore.document import Document
-from typing import Literal
+import json
+import re
+from typing import Dict, List, Optional, Any, Union
+from dataclasses import dataclass
 
-class FilterCondition(BaseModel):
-    field: str = Field(..., description="Column name to filter on")
-    operator: Literal['contains', 'not_contains', 'equals', 'not_equals', 'greater_than', 'less_than'] = Field(..., description="Filter operator")
-    value: str = Field(..., description="Value to search for")
-
-class FilterList(BaseModel):
-    filters: List[FilterCondition]
+@dataclass
+class SearchCriteria:
+    categories: List[str] = None
+    locations: Dict[str, str] = None
+    digital_requirements: Dict[str, str] = None
+    business_context: Dict[str, str] = None
+    exclude_criteria: Dict[str, Any] = None
+    sort_preferences: List[str] = None
+    limit: int = 50
 
 class HybridSearchToolBox:
-    def __init__(self, df: pd.DataFrame, llm):
-        self.df = df
+    def __init__(self, df, llm):
+        self.df = df.copy()
         self.llm = llm
-        self.column_descriptions = self._get_column_descriptions()
-        self._create_content_vector_store()
-        self._create_extractor_chain()
-
-    def _get_column_descriptions(self) -> dict:
-        """Get descriptions for available columns."""
-        descriptions = {
-            'Prospect Business Name': 'Business name of the prospect',
-            'Primary Category': 'Main industry category',
-            'City': 'Business location city',
-            'State': 'Business location state', 
-            'Customer': 'Customer/client name',
-            'Sales Rep Name': 'Assigned sales representative',
-            'Website': 'Business website URL'
+        
+        # Update column mapping to match your actual data structure
+        self.column_map = {
+            'customer': 'Customer',
+            'products': 'Products', 
+            'business_name': 'Prospect Business Name',  # Updated
+            'category_primary': 'Primary Category',     # Updated  
+            'category_secondary': 'Category - Secondary',
+            'state': 'State',
+            'city': 'City',
+            'phone': 'Phone',
+            'email': 'Email',
+            'website': 'Website URL',
+            'sales_rep': 'User Name',
+            'facebook': 'FB latest_posts',
+            'instagram': 'Insta Latest Posts',
+            'twitter': 'Latest Tweets',
+            'reviews': 'Reviews (local and social)',
+            'google_ads': 'SEM',
+            'google_places': 'Google Places',           # Added
+            'display_ads': 'Display ads',
+            'comp1_name': 'Business Name - Comp 1',
+            'comp2_name': 'Business Name - Comp 2',
+            'comp3_name': 'Business Name - Comp 3'
         }
         
-        # Add digital signal descriptions if columns exist
-        digital_signals = {
-            'SEM': 'Google Ads/Paid search activity (Yes/No)',
-            'FB latest_posts': 'Facebook posting activity (Yes/No)', 
-            'Reviews (local and social)': 'Review count and social presence',
-            'Display ads': 'Display advertising activity (Yes/No)',
-            'Google Places': 'Google My Business listing (Yes/No)'
-        }
-        
-        for col, desc in digital_signals.items():
-            if col in self.df.columns:
-                descriptions[col] = desc
-                
-        # Add competitor descriptions
-        for i in range(1, 4):
-            comp_col = f'Competitor_{i}_Name'
-            if comp_col in self.df.columns:
-                descriptions[comp_col] = f'Competitor {i} name'
-                
-        return descriptions
-
-    def _create_content_vector_store(self):
-        """Create vector store for semantic search."""
-        print("Creating content vector store...")
         try:
-            embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+            self.dataset_schema = self._analyze_dataset_schema()
+            self.sample_data = self._get_sample_data()
             
-            documents = []
-            for index, row in self.df.iterrows():
-                content_parts = []
-                
-                # Basic business info
-                if pd.notna(row.get('Prospect Business Name')):
-                    content_parts.append(f"Business: {row.get('Prospect Business Name')}")
-                if pd.notna(row.get('Primary Category')):
-                    content_parts.append(f"Category: {row.get('Primary Category')}")
-                if pd.notna(row.get('City')) and pd.notna(row.get('State')):
-                    content_parts.append(f"Location: {row.get('City')}, {row.get('State')}")
-                
-                # Digital signals
-                digital_signals = []
-                for signal in ['SEM', 'FB latest_posts', 'Google Places', 'Display ads']:
-                    if signal in self.df.columns and row.get(signal) == 'Yes':
-                        digital_signals.append(signal.replace('_', ' '))
-                
-                if digital_signals:
-                    content_parts.append(f"Digital: {', '.join(digital_signals)}")
-                
-                content = '. '.join(content_parts) if content_parts else f"Business {index}"
-                documents.append(Document(page_content=content, metadata={"index": index}))
+            print(f"Dataset loaded: {len(df)} rows")
+            self._analyze_data_distribution()
             
-            self.content_vector_store = FAISS.from_documents(documents, embedding_model)
-            print("Content vector store created successfully.")
         except Exception as e:
-            print(f"Error creating vector store: {e}")
-            self.content_vector_store = None
+            print(f"Error during initialization: {e}")
+            # Fallback minimal initialization
+            self.dataset_schema = {'columns': list(df.columns), 'sample_values': {}}
+            self.sample_data = []
 
-    def _create_extractor_chain(self):
-        """Create LLM chain for extracting filters."""
+    def _analyze_dataset_schema(self) -> Dict[str, Any]:
+        """Analyze dataset structure for LLM understanding"""
         try:
-            parser = self.llm.with_structured_output(FilterList)
-            prompt = ChatPromptTemplate.from_template(
-                "Extract filters from the user query.\n\n"
-                "Available fields:\n{columns}\n\n"
-                "QUERY INTERPRETATION RULES:\n"
-                "- 'Computer Contractors' -> field='Primary Category', operator='contains', value='Computer'\n"
-                "- 'in Texas' -> field='State', operator='equals', value='TX'\n"  
-                "- 'with Google ads' -> field='SEM', operator='equals', value='Yes'\n"
-                "- 'low local presence' -> field='Google Places', operator='equals', value='No'\n"
-                "- 'high spend' typically refers to 'SEM'='Yes'\n\n"
-                "Query: {query}"
-            )
-            self.extractor_chain = prompt | parser
-        except Exception as e:
-            print(f"Error creating extractor chain: {e}")
-            self.extractor_chain = None
-
-    def find_prospects_hybrid(self, query: str) -> List[Dict]:
-        """Intelligent hybrid search with error handling."""
-        print(f"Processing query: {query}")
-
-        try:
-            # Extract filters
-            if self.extractor_chain:
+            schema = {
+                'columns': list(self.df.columns),
+                'data_types': {},
+                'unique_counts': {},
+                'sample_values': {},
+                'null_counts': {}
+            }
+            
+            # Safe data type extraction
+            for col in self.df.columns:
                 try:
-                    column_info = "\n".join([f"- {name}: {desc}" for name, desc in self.column_descriptions.items()])
-                    filter_obj = self.extractor_chain.invoke({"query": query, "columns": column_info})
-                    filters = filter_obj.filters if hasattr(filter_obj, 'filters') else []
+                    schema['data_types'][col] = str(self.df[col].dtype)
+                    schema['unique_counts'][col] = int(self.df[col].nunique())
+                    schema['null_counts'][col] = int(self.df[col].isnull().sum())
                 except Exception as e:
-                    print(f"Filter extraction error: {e}")
-                    filters = self._parse_query_manually(query)
-            else:
-                filters = self._parse_query_manually(query)
-
-            print(f"Extracted filters: {[(f.field, f.operator, f.value) for f in filters]}")
+                    print(f"Error analyzing column {col}: {e}")
+                    schema['data_types'][col] = 'unknown'
+                    schema['unique_counts'][col] = 0
+                    schema['null_counts'][col] = 0
             
-            # Apply filters
-            filtered_df = self._apply_filters_safe(self.df.copy(), filters)
-            print(f"Results after filtering: {len(filtered_df)}")
-
-            if filtered_df.empty:
-                return self._handle_empty_results(query)
-
-            # Return structured results
-            results = self._format_results(filtered_df, query)
-            return results[:10]  # Limit to top 10
+            # Get sample values for categorical columns
+            for col in self.df.columns:
+                try:
+                    if self.df[col].dtype == 'object' and self.df[col].nunique() < 100:
+                        unique_vals = self.df[col].dropna().unique()[:10]
+                        # Convert to strings to avoid unhashable types
+                        schema['sample_values'][col] = [str(val) for val in unique_vals if pd.notna(val)]
+                except Exception as e:
+                    print(f"Error getting sample values for {col}: {e}")
+                    schema['sample_values'][col] = []
+            
+            return schema
             
         except Exception as e:
-            print(f"Search error: {e}")
-            return [{"error": f"Search failed: {str(e)}", "suggestion": "Try a simpler query"}]
+            print(f"Error in schema analysis: {e}")
+            return {
+                'columns': list(self.df.columns) if hasattr(self.df, 'columns') else [],
+                'data_types': {},
+                'unique_counts': {},
+                'sample_values': {},
+                'null_counts': {}
+            }
+    
+    def _get_sample_data(self, n_samples: int = 3) -> List[Dict]:
+        """Get sample records for LLM context"""
+        try:
+            sample_df = self.df.head(n_samples)
+            # Convert to records and handle unhashable types
+            records = []
+            for _, row in sample_df.iterrows():
+                record = {}
+                for col in sample_df.columns:
+                    value = row[col]
+                    # Convert unhashable types to strings
+                    if isinstance(value, (dict, list, set)):
+                        record[col] = str(value)
+                    elif pd.isna(value):
+                        record[col] = 'N/A'
+                    else:
+                        record[col] = str(value)
+                records.append(record)
+            return records
+        except Exception as e:
+            print(f"Error in sample data generation: {e}")
+            return []
 
-    def _parse_query_manually(self, query: str) -> List[FilterCondition]:
-        """Manual query parsing as fallback."""
-        filters = []
-        query_lower = query.lower()
+    def find_prospects_hybrid(self, query: str) -> Dict:
+        """Main search function using LLM intelligence"""
+        print(f"\n=== PROCESSING: {query} ===")
         
-        # Category filters
-        if 'computer' in query_lower:
-            filters.append(FilterCondition(field='Primary Category', operator='contains', value='Computer'))
-        
-        # Location filters  
-        if 'texas' in query_lower or ' tx ' in query_lower:
-            filters.append(FilterCondition(field='State', operator='equals', value='TX'))
-        if 'california' in query_lower or ' ca ' in query_lower:
-            filters.append(FilterCondition(field='State', operator='equals', value='CA'))
+        try:
+            # Step 1: LLM analyzes the query and creates search criteria
+            search_criteria = self._llm_analyze_query(query)
             
-        # Digital presence filters
-        if 'google ads' in query_lower or 'high.*spend' in query_lower:
-            filters.append(FilterCondition(field='SEM', operator='equals', value='Yes'))
-        if 'low.*local' in query_lower or 'no.*local' in query_lower:
-            filters.append(FilterCondition(field='Google Places', operator='equals', value='No'))
-        if 'social media' in query_lower:
-            filters.append(FilterCondition(field='FB latest_posts', operator='equals', value='Yes'))
+            # Step 2: Execute search based on LLM-generated criteria
+            df_result = self._execute_intelligent_search(search_criteria)
             
-        return filters
-
-    def _apply_filters_safe(self, df: pd.DataFrame, filters: List[FilterCondition]) -> pd.DataFrame:
-        """Apply filters with comprehensive error handling."""
-        for f in filters:
-            try:
-                if f.field not in df.columns:
-                    print(f"Column '{f.field}' not found. Available: {list(df.columns[:5])}")
-                    continue
-
-                col_data = df[f.field].astype(str)
-                filter_value = str(f.value).strip()
-
-                if f.operator == 'contains':
-                    mask = col_data.str.contains(filter_value, case=False, na=False, regex=False)
-                elif f.operator == 'equals':
-                    if f.field == 'State' and len(filter_value) > 2:
-                        filter_value = self._get_state_abbrev(filter_value)
-                    mask = col_data.str.upper() == filter_value.upper()
-                elif f.operator == 'not_equals':
-                    mask = col_data.str.upper() != filter_value.upper()
-                else:
-                    continue  # Skip unsupported operators
-                    
-                df = df[mask]
+            # Step 3: Format results
+            if len(df_result) > 0:
+                results = self._format_results(df_result.head(search_criteria.limit))
+                return {
+                    "prospects": results,
+                    "total_found": len(df_result),
+                    "showing": len(results),
+                    "filters_applied": self._get_applied_filters(search_criteria),
+                    "query": query
+                }
+            else:
+                return self._provide_smart_suggestions(query, [])
                 
-            except Exception as e:
-                print(f"Error applying filter {f.field}: {e}")
-                continue
+        except Exception as e:
+            print(f"ERROR: {str(e)}")
+            return {"error": f"Search failed: {str(e)}", "prospects": []}
 
+    def _llm_analyze_query(self, query: str) -> SearchCriteria:
+        """Use LLM to understand query and generate search criteria"""
+        
+        prompt = f"""
+You are analyzing a business prospect database query. Generate precise search criteria.
+
+DATASET SCHEMA:
+Columns: {self.dataset_schema['columns']}
+Sample values: {json.dumps(self.dataset_schema['sample_values'], indent=2)}
+Total records: {len(self.df)}
+
+USER QUERY: "{query}"
+
+Generate JSON response with search criteria:
+
+{{
+    "categories": ["exact category names from Category - Primary that match"],
+    "locations": {{"state": "state code", "city": "city name"}},
+    "digital_requirements": {{"column_name": "Yes/No for digital presence"}},
+    "business_context": {{"customer": "customer name", "sales_rep": "rep name"}},
+    "exclude_criteria": {{"column_name": "values to exclude"}},
+    "sort_preferences": ["preference1", "preference2"],
+    "limit": 50,
+    "reasoning": "Brief explanation"
+}}
+
+Rules:
+1. Use exact column names from schema
+2. For categories, match from sample values when possible
+3. Map digital requirements to actual columns (FB latest_posts, SEM, etc.)
+4. Extract state codes and city names for locations
+5. Set appropriate limit based on query context
+
+Generate ONLY the JSON response:
+"""
+
+        try:
+            llm_response = self._call_llm(prompt)
+            response_data = json.loads(llm_response.strip())
+            
+            criteria = SearchCriteria(
+                categories=response_data.get('categories'),
+                locations=response_data.get('locations'),
+                digital_requirements=response_data.get('digital_requirements'),
+                business_context=response_data.get('business_context'),
+                exclude_criteria=response_data.get('exclude_criteria'),
+                sort_preferences=response_data.get('sort_preferences', []),
+                limit=response_data.get('limit', 50)
+            )
+            
+            print(f"LLM Reasoning: {response_data.get('reasoning', 'No reasoning provided')}")
+            return criteria
+            
+        except json.JSONDecodeError as e:
+            print(f"LLM response parsing error: {e}")
+            return SearchCriteria(limit=50)
+        except Exception as e:
+            print(f"LLM analysis error: {e}")
+            return SearchCriteria(limit=50)
+
+    def _execute_intelligent_search(self, criteria: SearchCriteria) -> pd.DataFrame:
+        """Execute search based on LLM-generated criteria"""
+        df = self.df.copy()
+        
+        # Apply category filters
+        if criteria.categories:
+            category_col = self.column_map['category_primary']
+            if category_col in df.columns:
+                category_mask = df[category_col].isin(criteria.categories)
+                df = df[category_mask]
+                print(f"After category filter: {len(df)} records")
+        
+        # Apply location filters
+        if criteria.locations:
+            for loc_type, value in criteria.locations.items():
+                col_name = self.column_map.get(loc_type)
+                if col_name and col_name in df.columns:
+                    if loc_type == 'state':
+                        df = df[df[col_name].str.upper() == value.upper()]
+                    elif loc_type == 'city':
+                        df = df[df[col_name].str.contains(value, case=False, na=False)]
+            print(f"After location filter: {len(df)} records")
+        
+        # Apply digital requirements
+        if criteria.digital_requirements:
+            for digital_col, requirement in criteria.digital_requirements.items():
+                # Map to actual column names
+                actual_col = None
+                for key, col_name in self.column_map.items():
+                    if digital_col.lower() in key.lower() or digital_col in col_name:
+                        actual_col = col_name
+                        break
+                
+                if actual_col and actual_col in df.columns:
+                    if requirement.upper() == 'YES':
+                        df = df[df[actual_col].notna() & (df[actual_col].str.upper() != 'NO')]
+                    elif requirement.upper() == 'NO':
+                        df = df[df[actual_col].isna() | (df[actual_col].str.upper() == 'NO')]
+            print(f"After digital filter: {len(df)} records")
+        
+        # Apply business context filters
+        if criteria.business_context:
+            for context_type, value in criteria.business_context.items():
+                col_name = self.column_map.get(context_type)
+                if col_name and col_name in df.columns:
+                    df = df[df[col_name].str.contains(value, case=False, na=False)]
+            print(f"After business context filter: {len(df)} records")
+        
+        # Apply exclusion criteria
+        if criteria.exclude_criteria:
+            for col, exclude_values in criteria.exclude_criteria.items():
+                if col in df.columns:
+                    if isinstance(exclude_values, list):
+                        df = df[~df[col].isin(exclude_values)]
+                    else:
+                        df = df[df[col] != exclude_values]
+        
         return df
 
-    def _format_results(self, df: pd.DataFrame, query: str) -> List[Dict]:
-        """Format results in structured format."""
+    def _get_applied_filters(self, criteria: SearchCriteria) -> List[str]:
+        """Get list of applied filters for response"""
+        filters = []
+        
+        if criteria.categories:
+            filters.extend([f"Category: {cat}" for cat in criteria.categories])
+        
+        if criteria.locations:
+            filters.extend([f"Location {k}: {v}" for k, v in criteria.locations.items()])
+        
+        if criteria.digital_requirements:
+            filters.extend([f"Digital {k}: {v}" for k, v in criteria.digital_requirements.items()])
+        
+        if criteria.business_context:
+            filters.extend([f"Business {k}: {v}" for k, v in criteria.business_context.items()])
+        
+        return filters
+
+    def _format_results(self, df: pd.DataFrame) -> List[Dict]:
+        """Format results for display - keep original structure"""
         results = []
         
         for _, row in df.iterrows():
-            try:
-                # Basic info
-                business_name = str(row.get('Prospect Business Name', 'Unknown'))
-                category = str(row.get('Primary Category', 'Unknown'))
-                location = f"{str(row.get('City', 'Unknown'))}, {str(row.get('State', 'Unknown'))}"
+            # Basic info
+            result = {
+                'business_name': str(row.get(self.column_map['business_name'], 'Unknown')),
+                'category': str(row.get(self.column_map['category_primary'], 'Unknown')),
+                'location': f"{row.get(self.column_map['city'], '')}, {row.get(self.column_map['state'], '')}".strip(', '),
+            }
+            
+            # Digital presence summary
+            digital_signals = []
+            if row.get(self.column_map['google_ads']) == 'Yes':
+                digital_signals.append('Google Ads')
+            if row.get(self.column_map['facebook']) == 'Yes':
+                digital_signals.append('Facebook')
+            if row.get(self.column_map['reviews']) == 'Yes':
+                digital_signals.append('Reviews')
                 
-                # Digital presence summary
-                digital_status = []
-                if row.get('SEM') == 'Yes':
-                    digital_status.append('Google Ads Active')
-                if row.get('Google Places') == 'Yes':
-                    digital_status.append('Local SEO')
-                else:
-                    digital_status.append('Low Local Presence')
-                if row.get('FB latest_posts') == 'Yes':
-                    digital_status.append('Social Media')
-                
-                # Opportunities
-                opportunities = []
-                if row.get('Google Places') == 'No':
-                    opportunities.append('Local SEO Setup')
-                if row.get('SEM') == 'No':
-                    opportunities.append('Google Ads')
-                if row.get('FB latest_posts') == 'No':
-                    opportunities.append('Social Media')
-                
-                result = {
-                    'business_name': business_name,
-                    'category': category,
-                    'location': location,
-                    'digital_status': ', '.join(digital_status) if digital_status else 'Limited Presence',
-                    'opportunities': ', '.join(opportunities) if opportunities else 'Optimization',
-                    'sales_rep': str(row.get('Sales Rep Name', 'Unassigned')),
-                    'contact': {
-                        'phone': str(row.get('Prospect Phone', 'Not Available')),
-                        'email': str(row.get('Prospect Email', 'Not Available'))
-                    }
-                }
-                results.append(result)
-                
-            except Exception as e:
-                print(f"Error formatting result: {e}")
-                continue
-                
+            result['digital_presence'] = ', '.join(digital_signals) if digital_signals else 'Limited'
+            
+            # Contact info
+            result['contact'] = {
+                'phone': str(row.get(self.column_map['phone'], 'N/A')),
+                'email': str(row.get(self.column_map['email'], 'N/A')),
+                'website': str(row.get(self.column_map['website'], 'N/A'))
+            }
+            
+            # Business context
+            result['customer'] = str(row.get(self.column_map['customer'], 'Unknown'))
+            result['sales_rep'] = str(row.get(self.column_map['sales_rep'], 'Unassigned'))
+            
+            results.append(result)
+        
         return results
 
-    def _handle_empty_results(self, query: str) -> List[Dict]:
-        """Handle when no results found."""
-        # Show available categories/states as suggestions
-        categories = self.df['Primary Category'].value_counts().head(5).to_dict()
-        states = self.df['State'].value_counts().head(5).to_dict()
+    def _provide_smart_suggestions(self, query: str, filters_applied: List[str]) -> Dict:
+        """Provide smart suggestions using LLM when no results found"""
         
-        return [{
-            'message': 'No exact matches found',
-            'suggestions': {
-                'available_categories': categories,
-                'available_states': states,
-                'sample_query': 'Find computer businesses in Texas'
-            }
-        }]
-
-    def _get_state_abbrev(self, state_name: str) -> str:
-        """Convert state name to abbreviation."""
-        state_map = {
-            'texas': 'TX', 'california': 'CA', 'florida': 'FL', 'new york': 'NY',
-            'illinois': 'IL', 'pennsylvania': 'PA', 'ohio': 'OH', 'georgia': 'GA'
+        availability_summary = {
+            'total_records': len(self.df),
+            'available_categories': {},
+            'available_states': {},
+            'digital_signal_stats': {}
         }
-        return state_map.get(state_name.lower(), state_name.upper()[:2])
+        
+        # Get actual data availability
+        cat_col = self.column_map.get('category_primary')
+        if cat_col and cat_col in self.df.columns:
+            availability_summary['available_categories'] = self.df[cat_col].value_counts().head(10).to_dict()
+        
+        state_col = self.column_map.get('state')
+        if state_col and state_col in self.df.columns:
+            availability_summary['available_states'] = self.df[state_col].value_counts().head(10).to_dict()
+        
+        # Digital signal stats
+        for signal_key, col_name in [('SEM', self.column_map['google_ads']), 
+                                    ('Reviews', self.column_map['reviews']), 
+                                    ('Facebook', self.column_map['facebook'])]:
+            if col_name in self.df.columns:
+                availability_summary['digital_signal_stats'][signal_key] = (self.df[col_name] == 'Yes').sum()
+        
+        suggestions_prompt = f"""
+User query "{query}" returned no results.
 
-    def get_prospect_details(self, prospect_name: str) -> Optional[Dict]:
-        """Get detailed prospect information."""
+AVAILABLE DATA:
+{json.dumps(availability_summary, indent=2)}
+
+Generate helpful suggestions in JSON format:
+{{
+    "message": "Explanation of why no results found",
+    "suggestions": [
+        "Alternative search suggestion 1",
+        "Alternative search suggestion 2"
+    ],
+    "data_insights": [
+        "Available data insight 1",
+        "Available data insight 2"
+    ]
+}}
+"""
+        
         try:
-            match = self.df[self.df['Prospect Business Name'].str.contains(prospect_name, case=False, na=False)]
-            if match.empty:
-                return None
-                
-            prospect = match.iloc[0]
-            
-            # Calculate scores
-            digital_score = self._calculate_digital_score(prospect)
+            response = self._call_llm(suggestions_prompt)
+            suggestion_data = json.loads(response.strip())
             
             return {
-                'business_name': str(prospect.get('Prospect Business Name')),
-                'category': str(prospect.get('Primary Category')),
-                'location': f"{str(prospect.get('City'))}, {str(prospect.get('State'))}",
-                'contact': {
-                    'phone': str(prospect.get('Prospect Phone', 'Not Available')),
-                    'email': str(prospect.get('Prospect Email', 'Not Available')),
-                    'website': str(prospect.get('Website', 'Not Available'))
-                },
-                'digital_score': f"{digital_score}/10",
-                'current_presence': {
-                    'google_ads': str(prospect.get('SEM', 'No')),
-                    'local_seo': str(prospect.get('Google Places', 'No')),
-                    'social_media': str(prospect.get('FB latest_posts', 'No'))
-                },
-                'sales_rep': str(prospect.get('Sales Rep Name', 'Unassigned')),
-                'opportunities': self._get_opportunities(prospect)
+                "prospects": [],
+                "total_found": 0,
+                "query": query,
+                "filters_applied": filters_applied,
+                "suggestions": suggestion_data.get('suggestions', []),
+                "message": suggestion_data.get('message', 'No results found.')
+            }
+        except:
+            return {
+                "prospects": [],
+                "total_found": 0,
+                "query": query,
+                "filters_applied": filters_applied,
+                "suggestions": ["Try broader search terms", "Check category names", "Verify location spelling"],
+                "message": "No results found. Try adjusting your search criteria."
+            }
+
+    def get_prospect_details(self, prospect_name: str) -> Optional[Dict]:
+        """Get optimized prospect analysis for insights agent"""
+        try:
+            business_col = self.column_map['business_name']
+            
+            match = self.df[self.df[business_col].str.contains(prospect_name, case=False, na=False)]
+            if match.empty:
+                return {"error": f"No business found containing '{prospect_name}'"}
+            
+            prospect = match.iloc[0]
+            
+            # Calculate digital score efficiently
+            digital_score = 0
+            signals = ['google_ads', 'facebook', 'instagram', 'twitter', 'reviews', 'display_ads']
+            active_signals = []
+            missing_signals = []
+            
+            for signal in signals:
+                col_name = self.column_map.get(signal)
+                if col_name and col_name in self.df.columns:
+                    value = prospect.get(col_name, 'No')
+                    if str(value).upper() == 'YES':
+                        digital_score += 1
+                        active_signals.append(signal.replace('_', ' ').title())
+                    else:
+                        missing_signals.append(signal.replace('_', ' ').title())
+            
+            # Count competitors
+            competitor_count = 0
+            for i in range(1, 4):
+                comp_col = self.column_map[f'comp{i}_name']
+                if comp_col in self.df.columns:
+                    comp_name = prospect.get(comp_col)
+                    if pd.notna(comp_name) and str(comp_name).strip():
+                        competitor_count += 1
+            
+            # Return compact analysis
+            return {
+                'business_name': str(prospect.get(business_col)),
+                'category': str(prospect.get(self.column_map['category_primary'], 'Unknown')),
+                'location': f"{prospect.get(self.column_map['city'], '')}, {prospect.get(self.column_map['state'], '')}".strip(', '),
+                'digital_score': f"{digital_score}/6",
+                'active_channels': ', '.join(active_signals[:3]) if active_signals else 'None',
+                'missing_channels': ', '.join(missing_signals[:3]) if missing_signals else 'None',
+                'competitor_count': competitor_count,
+                'sales_rep': str(prospect.get(self.column_map['sales_rep'], 'Unassigned')),
+                'top_opportunities': missing_signals[:2] if missing_signals else ['Digital optimization']
             }
             
         except Exception as e:
-            print(f"Error getting prospect details: {e}")
-            return None
+            return {"error": f"Analysis failed: {str(e)}"}
+        
+    def _analyze_data_distribution(self):
+        """Analyze the actual data to understand patterns - keep original"""
+        try:
+            print("\n=== DATASET ANALYSIS ===")
+            
+            # Categories analysis - using actual column name
+            category_col = self.column_map.get('category_primary')
+            if category_col and category_col in self.df.columns:
+                try:
+                    categories = self.df[category_col].value_counts().head(10)
+                    print(f"Top Categories: {dict(categories)}")
+                except Exception as e:
+                    print(f"Error analyzing categories: {e}")
+            
+            # States analysis
+            state_col = self.column_map.get('state')
+            if state_col and state_col in self.df.columns:
+                try:
+                    states = self.df[state_col].value_counts().head(10)
+                    print(f"Top States: {dict(states)}")
+                except Exception as e:
+                    print(f"Error analyzing states: {e}")
+            
+            # Digital signals analysis
+            digital_cols = ['google_ads', 'facebook', 'reviews', 'display_ads', 'google_places']
+            for signal in digital_cols:
+                col_name = self.column_map.get(signal)
+                if col_name and col_name in self.df.columns:
+                    try:
+                        values = self.df[col_name].value_counts()
+                        print(f"{signal.title()}: {dict(values)}")
+                    except Exception as e:
+                        print(f"Error analyzing {signal}: {e}")
+                        
+        except Exception as e:
+            print(f"Error in data distribution analysis: {e}")
 
-    def _calculate_digital_score(self, row) -> int:
-        """Calculate digital presence score."""
-        score = 0
-        if row.get('SEM') == 'Yes':
-            score += 3
-        if row.get('Google Places') == 'Yes':
-            score += 2
-        if row.get('FB latest_posts') == 'Yes':
-            score += 2
-        if row.get('Display ads') == 'Yes':
-            score += 2
-        return min(score, 10)
-
-    def _get_opportunities(self, row) -> List[str]:
-        """Identify opportunities for prospect."""
-        opportunities = []
-        if row.get('SEM') == 'No':
-            opportunities.append('Google Ads Setup')
-        if row.get('Google Places') == 'No':
-            opportunities.append('Local SEO Optimization')
-        if row.get('FB latest_posts') == 'No':
-            opportunities.append('Social Media Management')
-        return opportunities
+    def _call_llm(self, prompt: str) -> str:
+        """Call LLM service - customize based on your provider"""
+        try:
+            # For OpenAI
+            if hasattr(self.llm, 'chat'):
+                response = self.llm.chat.completions.create(
+                    model="gpt-4",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.1,
+                    max_tokens=2000
+                )
+                return response.choices[0].message.content
+            
+            # For Anthropic Claude
+            elif hasattr(self.llm, 'messages'):
+                response = self.llm.messages.create(
+                    model="claude-3-sonnet-20240229",
+                    max_tokens=2000,
+                    temperature=0.1,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                return response.content[0].text
+            
+            # Fallback mock for testing
+            else:
+                return self._mock_llm_response(prompt)
+                
+        except Exception as e:
+            print(f"LLM call failed: {e}")
+            return self._mock_llm_response(prompt)
+    
+    def _mock_llm_response(self, prompt: str) -> str:
+        """Mock LLM response for testing"""
+        if "generate search criteria" in prompt.lower():
+            return json.dumps({
+                "categories": [],
+                "locations": {},
+                "digital_requirements": {},
+                "business_context": {},
+                "sort_preferences": [],
+                "limit": 50,
+                "reasoning": "Mock response for testing"
+            })
+        else:
+            return json.dumps({
+                "message": "No results found for your query.",
+                "suggestions": ["Try different search terms", "Check spelling"],
+                "data_insights": ["Dataset contains multiple categories"]
+            })

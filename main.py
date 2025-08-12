@@ -38,7 +38,7 @@ class SalesSystem:
         
         # Get and clean environment variables
         groq_api_key = os.getenv("GROQ_API_KEY", "").strip('"').strip("'")
-        model_name = os.getenv("MODEL_NAME", "llama-3.3-70b-versatile").strip('"').strip("'")
+        model_name = os.getenv("MODEL_NAME", "openai/gpt-oss-120b").strip('"').strip("'")
         temperature = float(os.getenv("TEMPERATURE", "0.1").strip('"').strip("'"))
         data_file_path = os.getenv("DATA_FILE_PATH", "data/prospects.xlsx").strip('"').strip("'")
         
